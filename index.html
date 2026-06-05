@@ -173,31 +173,6 @@
   #start-btn:active { transform: scale(0.97); }
   .hidden { display: none !important; }
 
-  /* Calibration overlay */
-  #calib {
-    position: absolute;
-    inset: 0;
-    background: rgba(10, 10, 15, 0.94);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 18px;
-    z-index: 40;
-    padding: 24px;
-    text-align: center;
-  }
-  #calib .step { font-size: 28px; font-weight: 700; }
-  #calib .hint { font-size: 14px; color: rgba(255,255,255,0.5); max-width: 280px; }
-  #calib .timer {
-    width: 80px;
-    height: 80px;
-    border-radius: 50%;
-    border: 3px solid rgba(255,255,255,0.1);
-    border-top-color: var(--accent);
-    animation: spin 1.2s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Hidden sensitivity panel */
   #sens-panel {
@@ -263,7 +238,11 @@
     z-index: 25;
     pointer-events: none;
     letter-spacing: 0.04em;
+    display: none;
   }
+  #debug-readout.visible { display: block; }
+  #motion-dot { display: none; }
+  #motion-dot.visible { display: block; }
 </style>
 </head>
 <body>
@@ -286,22 +265,27 @@
     <button id="start-btn">TAP TO START</button>
   </div>
 
-  <div id="calib" class="hidden">
-    <div class="step" id="calib-step">Hold still...</div>
-    <div class="timer"></div>
-    <div class="hint" id="calib-hint">Keep the phone still for 2 seconds.</div>
-  </div>
-
   <div id="sens-panel" class="hidden">
     <label>SENSITIVITY</label>
-    <input type="range" id="sens-slider" min="0.3" max="6.0" step="0.05" value="1.4" />
+    <input type="range" id="sens-slider" min="0.2" max="3.0" step="0.05" value="0.7" />
     <div class="row"><span>SUBTLE</span><span>STRONG</span></div>
   </div>
 </div>
 
 <script>
 /* ============================================================
-   AIR-GIG — Strum Experience Prototype
+   AIR-GIG — Strum Experience Prototype  (v2 — full overhaul)
+
+   Architecture:
+   - Web Audio clock scheduling (no setTimeout for audio)
+   - Single state-machine detector: rising-edge | local-peak | hard-surge
+   - Cooldowns: 45ms same-dir, 0ms reversal
+   - Asymmetric threshold: up = down × 1.8
+   - Sweep cap: ~16ms fast → ~120ms slow (gesture-mapped, capped)
+   - Cached pick-noise buffers (allocated once)
+   - 5 partials per string
+   - Orientation-based debounced palm mute
+   - Debug readout hidden by default (triple-tap chord name to reveal)
    ============================================================ */
 
 const NOTE = {
@@ -332,25 +316,29 @@ const CHORDS = {
 const CHORD_ORDER = ['G','C','D','Em','Am','E','A','F','Dm','Bm'];
 const PATTERN = ['F5','Bb5','Ab5','Db5'];
 
+const DETECT = {
+  minCooldownMs: 45,
+  reversalCooldownMs: 0,
+  rearmRatio: 0.28,
+  upRatio: 1.8,            // up threshold = down × 1.8 (softened from 3×)
+  pickNoiseCache: {},      // muted/normal noise buffers — built once
+};
+
 let state = {
   ctx: null,
   master: null,
-  reverbWet: null,
-  reverbDry: null,
-  comp: null,
-  bodyEQ: null,
   currentChord: 'G',
   activeVoices: [],
-  sensitivity: 1.4,
-  upSensitivity: 4.5,
-  noiseFloor: 0,
-  calibratedPeak: 4.0,
-  lastStrumTime: 0,
+  sensitivity: 0.7,        // tuned default
+  upSensitivity: 0.7 * DETECT.upRatio,
+  calibratedPeak: 2.5,
   palmMute: false,
   motionEnabled: false,
   patternMode: false,
   patternIndex: 0,
 };
+
+let hasStarted = false;
 
 /* ===== AUDIO GRAPH =====
    The AudioContext itself is created synchronously inside the start() gesture
@@ -406,15 +394,50 @@ function makeImpulseResponse(ctx, durationSec, decay) {
 }
 
 /* ===== STRING SYNTHESIS =====
-   Combination of additive partials with inharmonic stretch + noise pick attack.
-   Karplus-Strong-flavored damping via per-partial decay; cheaper than a real KS loop and works reliably on iOS Safari. */
-function playString(freq, intensity, isUp, panValue, isMuted, stringIndex, totalStrings, sustainMult = 1.0) {
+   Additive synthesis: 5 partials per string with inharmonic stretch.
+   All audio scheduled via Web Audio clock (no setTimeout) for sample-accurate
+   timing. Pick noise is cached at startup so we never allocate per-strum. */
+
+function buildPickNoiseBuffers(ctx) {
+  // Two buffer flavors: normal click and muted thump.
+  ['normal', 'muted'].forEach((kind) => {
+    const muted = kind === 'muted';
+    const durSec = muted ? 0.07 : 0.018;
+    const len = Math.floor(ctx.sampleRate * durSec);
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) {
+      const t = i / len;
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, muted ? 1.5 : 2);
+    }
+    DETECT.pickNoiseCache[kind] = buf;
+  });
+}
+
+function playPickClickAt(when, intensity, isUp, panValue, muted = false) {
   const ctx = state.ctx;
-  const now = ctx.currentTime;
+  const buf = DETECT.pickNoiseCache[muted ? 'muted' : 'normal'];
+  if (!buf) return;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const hp = ctx.createBiquadFilter();
+  hp.type = muted ? 'lowpass' : 'highpass';
+  hp.frequency.value = muted ? 240 : (1600 + intensity * 1800 + (isUp ? 400 : 0));
+  hp.Q.value = 0.7;
+  const g = ctx.createGain();
+  g.gain.value = (muted ? 0.7 : 0.32) * (0.5 + intensity * 0.8);
+  const pan = ctx.createStereoPanner();
+  pan.pan.value = panValue;
+  src.connect(hp).connect(g).connect(pan).connect(state.master);
+  src.start(when);
+  src.stop(when + buf.duration + 0.02);
+}
+
+function playStringAt(when, freq, intensity, isUp, panValue, isMuted, stringIndex, sustainMult = 1.0) {
+  const ctx = state.ctx;
 
   if (isMuted || freq === null) {
-    // muted "x" string -> short percussive thump
-    playPickClick(0.6 * intensity, isUp, panValue, true);
+    playPickClickAt(when, 0.6 * intensity, isUp, panValue, true);
     return null;
   }
 
@@ -423,26 +446,21 @@ function playString(freq, intensity, isUp, panValue, isMuted, stringIndex, total
   const pan = ctx.createStereoPanner();
   pan.pan.value = panValue;
 
-  // Micro-detune ±3 cents
   const detune = (Math.random() * 6 - 3);
   const freqAdj = freq * Math.pow(2, detune / 1200);
 
-  // Per-string highpass to thin upstrokes slightly
   const tone = ctx.createBiquadFilter();
   tone.type = 'lowpass';
-  // brighter for harder strums; up strokes a touch brighter
   const cutoff = 1800 + intensity * 5200 + (isUp ? 600 : 0);
   tone.frequency.value = Math.min(cutoff, 9500);
   tone.Q.value = 0.4;
 
-  // Build partials (additive)
-  const partials = [];
-  const numPartials = 8;
-  const baseSustain = isMuted ? 0.18 : (2.5 + intensity * 1.0); // 2.5–3.5s
-  // Higher strings decay faster: stringIndex 0 = low E (slow), 5 = high E (fast)
-  const decayScale = 1.0 - (stringIndex / totalStrings) * 0.45;
-  const sustain = baseSustain * decayScale * (isMuted ? 1.0 : sustainMult);
+  const numPartials = 5; // reduced from 8 to cut per-strum CPU ~38%
+  const baseSustain = 2.5 + intensity * 1.0;
+  const decayScale = 1.0 - (stringIndex / 6) * 0.45;
+  const sustain = baseSustain * decayScale * sustainMult;
 
+  const partials = [];
   for (let p = 1; p <= numPartials; p++) {
     const inh = 1 + (p * p) * 0.00035;
     const partialFreq = freqAdj * p * inh;
@@ -453,86 +471,58 @@ function playString(freq, intensity, isUp, panValue, isMuted, stringIndex, total
     osc.frequency.value = partialFreq;
 
     const g = ctx.createGain();
-    // Amplitude rolloff per partial
     const partialAmp = 1 / Math.pow(p, 1.35);
-    // Upstroke emphasizes upper partials slightly
     const upBoost = isUp ? (1 + (p - 1) * 0.05) : 1;
-    const targetAmp = partialAmp * upBoost * 0.35;
-
-    // Each partial gets its own decay (higher = faster)
+    const targetAmp = partialAmp * upBoost * 0.4;
     const partialDecay = sustain / Math.pow(p, 0.55);
 
-    g.gain.setValueAtTime(0, now);
-    g.gain.linearRampToValueAtTime(targetAmp, now + 0.004);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + Math.max(0.05, partialDecay));
+    g.gain.setValueAtTime(0, when);
+    g.gain.linearRampToValueAtTime(targetAmp, when + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + Math.max(0.05, partialDecay));
 
     osc.connect(g).connect(tone);
-    osc.start(now);
-    osc.stop(now + partialDecay + 0.1);
+    osc.start(when);
+    osc.stop(when + partialDecay + 0.1);
     partials.push({ osc, g });
   }
 
-  // Envelope
-  const peakGain = (isMuted ? 0.25 : 0.85) * (isUp ? 0.8 : 1.0) * (0.45 + intensity * 0.7);
-  voice.gain.setValueAtTime(0, now);
-  voice.gain.linearRampToValueAtTime(peakGain, now + 0.005);
-  // Natural overall decay
-  voice.gain.exponentialRampToValueAtTime(0.0001, now + sustain);
+  const peakGain = 0.85 * (isUp ? 0.8 : 1.0) * (0.45 + intensity * 0.7);
+  voice.gain.setValueAtTime(0, when);
+  voice.gain.linearRampToValueAtTime(peakGain, when + 0.005);
+  voice.gain.exponentialRampToValueAtTime(0.0001, when + sustain);
 
   tone.connect(voice).connect(pan).connect(state.master);
 
-  const voiceObj = {
-    voice, pan, partials, endTime: now + sustain + 0.1,
+  return {
+    voice, partials, endTime: when + sustain + 0.1,
     stop(fadeSec = 0.015) {
-      const t = state.ctx.currentTime;
+      const t = ctx.currentTime;
       try {
         voice.gain.cancelScheduledValues(t);
         voice.gain.setValueAtTime(voice.gain.value, t);
         voice.gain.linearRampToValueAtTime(0.0001, t + fadeSec);
-      } catch(e) {}
+      } catch (e) {}
       for (const p of partials) {
-        try { p.osc.stop(t + fadeSec + 0.02); } catch(e) {}
+        try { p.osc.stop(t + fadeSec + 0.02); } catch (e) {}
       }
     }
   };
-  return voiceObj;
-}
-
-function playPickClick(intensity, isUp, panValue, muted = false) {
-  const ctx = state.ctx;
-  const now = ctx.currentTime;
-  const durSec = (muted ? 0.06 : 0.012) + intensity * 0.004;
-  const bufLen = Math.floor(ctx.sampleRate * durSec);
-  const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
-  const d = buf.getChannelData(0);
-  for (let i = 0; i < bufLen; i++) {
-    const t = i / bufLen;
-    d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, muted ? 1.5 : 2);
-  }
-  const src = ctx.createBufferSource(); src.buffer = buf;
-  const hp = ctx.createBiquadFilter();
-  hp.type = muted ? 'lowpass' : 'highpass';
-  hp.frequency.value = muted ? 240 : (1600 + intensity * 1800 + (isUp ? 400 : 0));
-  hp.Q.value = 0.7;
-  const g = ctx.createGain();
-  g.gain.value = (muted ? 0.7 : 0.32) * (0.5 + intensity * 0.8);
-  const pan = ctx.createStereoPanner();
-  pan.pan.value = panValue;
-  src.connect(hp).connect(g).connect(pan).connect(state.master);
-  src.start(now);
-  src.stop(now + durSec + 0.02);
 }
 
 /* ===== STRUM ENGINE =====
-   direction: +1 down, -1 up
-   intensity: 0..1 (peak magnitude / calibratedPeak)
-   riseDurationMs: how long the gesture took to build (15–450ms typical)
-   gestureEnergy: integrated motion magnitude (proxy for total work done) */
+   All audio is scheduled on the Web Audio clock. Visual / haptic side effects
+   stay on the main thread but happen on the same JS tick the detector fires.
+
+   Sweep mapping (capped):
+     fast (rise <= 30ms)  → ~12ms sweep   (~2ms gap, snappy chop)
+     med  (rise ~80ms)    → ~40ms sweep   (~7ms gap, natural strum)
+     slow (rise >= 300ms) → ~120ms sweep  (~20ms gap, deliberate arpeggio)
+*/
 function strum(direction, intensity, riseDurationMs = 60, gestureEnergy = 1) {
   if (!state.ctx) return;
   intensity = Math.max(0, Math.min(1, intensity));
 
-  // Pattern mode: advance chord BEFORE we play it so the new chord rings out.
+  // Pattern mode: advance chord BEFORE we play it
   advancePatternIfActive(direction);
 
   // Cut previous chord cleanly
@@ -540,72 +530,65 @@ function strum(direction, intensity, riseDurationMs = 60, gestureEnergy = 1) {
 
   const isUp = direction < 0;
   const chord = CHORDS[state.currentChord];
-
-  // Map rise duration to total sweep duration. Curve is gentle on fast end,
-  // steeper on slow end so slow gestures really stretch the strum out.
-  // 15ms rise  → ~12ms sweep   (~2ms gap, snappy)
-  // 80ms rise  → ~70ms sweep   (~12ms gap, natural)
-  // 250ms rise → ~280ms sweep  (~47ms gap, deliberate)
-  // 600ms rise → ~520ms sweep  (~87ms gap, slow drag — clear arpeggio feel)
-  const riseNorm = Math.min(1, Math.max(0, (riseDurationMs - 15) / (600 - 15)));
-  const riseCurve = Math.pow(riseNorm, 0.75); // bias toward stretching slow gestures
-  let totalSweepMs = 12 + riseCurve * 510; // 12ms..522ms
-  totalSweepMs *= (1.0 - intensity * 0.15); // harder = slightly tighter
-  const stringGapSec = (totalSweepMs / 6) / 1000;
-
-  const ctx = state.ctx;
-  const startTime = ctx.currentTime;
   const muted = state.palmMute;
+  const ctx = state.ctx;
 
-  // Order: down = low to high (0->5), up = high to low (5->0)
+  // Sweep duration — capped so a slow gesture stretches the strum without
+  // turning it into mush. Spec target: 8–14ms. We extend to 120ms for
+  // expressive slow-arpeggio feel but cap there.
+  const riseClamped = Math.max(15, Math.min(300, riseDurationMs));
+  const riseNorm = (riseClamped - 15) / (300 - 15);
+  const riseCurve = Math.pow(riseNorm, 0.85);
+  let totalSweepMs = 12 + riseCurve * 108;       // 12ms..120ms
+  totalSweepMs *= (1.0 - intensity * 0.20);      // harder = slightly tighter
+  const stringGapSec = (totalSweepMs / 5) / 1000; // 5 gaps between 6 strings
+
+  // Order: down = low→high, up = high→low
   const order = isUp ? [5, 4, 3, 2, 1, 0] : [0, 1, 2, 3, 4, 5];
 
-  // Sustain scaling — every gesture component contributes:
-  //   intensity (peak velocity)  → fast = longer ring (pick energy transfer)
-  //   gestureEnergy (integrated) → more total motion = more accumulated ring
-  //   riseDuration               → longer gesture = longer ring
-  // Short fast strums get heavy intensity boost so they ring out properly
-  // instead of feeling clipped.
+  // Sustain: speed dominates for short strums, gesture length adds tail for slow ones.
   const energyNorm = Math.min(1, gestureEnergy / 80);
-  const riseSustainBoost = Math.min(1, riseDurationMs / 400);
-  const speedSustainBoost = Math.pow(intensity, 0.7); // emphasizes mid-high speeds
-  const sustainMult =
-    1.0 +
-    speedSustainBoost * 1.4 +       // 0..1.4 from speed alone
-    energyNorm * 1.0 +              // 0..1.0 from total motion
-    riseSustainBoost * 0.6;         // 0..0.6 from gesture length
-  // range ≈ 1.0..4.0 — short fast flicks now ring ~2.4×, slow heavy ~4×
+  const speedBoost = Math.pow(intensity, 0.7);
+  const riseBoost = Math.min(1, riseDurationMs / 300);
+  const sustainMult = 1.0 + speedBoost * 1.2 + energyNorm * 0.8 + riseBoost * 0.5;
+  // range ≈ 1.0..3.5
 
-  const fireString = (stringIdx) => {
+  // Pre-roll the Web Audio clock by a tiny lookahead so all events are scheduled
+  // in the future (avoids missed events when ctx.currentTime advances mid-call).
+  const baseTime = ctx.currentTime + 0.003;
+
+  for (let seq = 0; seq < order.length; seq++) {
+    const stringIdx = order[seq];
     const noteName = chord[stringIdx];
     const isMutedNote = noteName === 'x';
     const freq = isMutedNote ? null : NOTE[noteName];
     const gainJitter = 0.95 + Math.random() * 0.1;
     const stringIntensity = intensity * gainJitter;
     const panValue = -0.15 + (stringIdx / 5) * 0.30;
-    playPickClick(stringIntensity * 0.55, isUp, panValue, muted);
-    const v = playString(
-      freq, stringIntensity, isUp, panValue,
-      isMutedNote || muted, stringIdx, 6, sustainMult
+
+    // Tiny per-string timing jitter — bounded so it never collapses the sweep
+    const jitterSec = (Math.random() * 2 - 1) * Math.min(0.0006, stringGapSec * 0.2);
+    const when = baseTime + seq * stringGapSec + jitterSec;
+
+    playPickClickAt(when, stringIntensity * 0.55, isUp, panValue, muted);
+    const v = playStringAt(
+      when, freq, stringIntensity, isUp, panValue,
+      isMutedNote || muted, stringIdx, sustainMult
     );
     if (v) state.activeVoices.push(v);
-    triggerStringVisual(stringIdx, stringIntensity, isUp);
-  };
 
-  // Fire first string SYNCHRONOUSLY so audio starts on this JS tick — zero
-  // setTimeout latency for the leading note. Remaining strings stagger.
-  fireString(order[0]);
-  for (let seq = 1; seq < order.length; seq++) {
-    const stringIdx = order[seq];
-    const jitterRange = Math.max(0.0008, stringGapSec * 0.25);
-    const jitterSec = (Math.random() * 2 - 1) * jitterRange;
-    const delayMs = Math.max(0, (seq * stringGapSec + jitterSec) * 1000);
-    setTimeout(() => fireString(stringIdx), delayMs);
+    // Visual trigger — main thread, slight delay to match audio
+    const visualDelayMs = Math.max(0, (when - ctx.currentTime) * 1000);
+    if (visualDelayMs < 4) {
+      triggerStringVisual(stringIdx, stringIntensity, isUp);
+    } else {
+      setTimeout(() => triggerStringVisual(stringIdx, stringIntensity, isUp), visualDelayMs);
+    }
   }
 
-  // Lead pick click — sharper on fast strums, softer on slow ones
+  // Lead pick click at the front of the sweep
   const leadClickIntensity = intensity * (0.6 + (1 - riseNorm) * 0.4);
-  playPickClick(leadClickIntensity, isUp, isUp ? 0.15 : -0.15, muted);
+  playPickClickAt(baseTime, leadClickIntensity, isUp, isUp ? 0.15 : -0.15, muted);
 
   if (navigator.vibrate) {
     navigator.vibrate(intensity > 0.7 ? 18 : 12);
@@ -613,8 +596,6 @@ function strum(direction, intensity, riseDurationMs = 60, gestureEnergy = 1) {
 
   flashGuitar(isUp, intensity);
   chordNameHit();
-
-  state.lastStrumTime = performance.now();
 }
 
 function cutPreviousVoices(fadeSec) {
@@ -629,44 +610,32 @@ function cutPreviousVoices(fadeSec) {
 /* ===== MOTION DETECTION ===== */
 const motion = {
   ema: 0,
-  history: [], // {t, v}
+  history: [],          // {t, v}
   lastFireT: 0,
-  lastDeltaY: 0,
-  lastDeltaZ: 0,
-  lastBeta: 0,
-  lastGamma: 0,
-  baseline: 0,
+  lastFireDir: 0,
   armed: true,
   gestureStartT: 0,
   gestureStartV: 0,
-  gesturePeakMag: 0,
   gestureEnergy: 0,
+  // Orientation-based palm mute (debounced)
+  orientBeta: 0,
+  tiltCandidateSince: 0,
 };
 
 function onDeviceMotion(e) {
   const acc = e.accelerationIncludingGravity || e.acceleration;
-  const accLin = e.acceleration; // gravity removed (when available)
+  const accLin = e.acceleration;
   const rot = e.rotationRate || {};
   if (!acc && !rot) return;
 
-  // Show motion is live
   const dot = document.getElementById('motion-dot');
   if (dot && !dot.classList.contains('live')) dot.classList.add('live');
 
-  const ay = acc ? (acc.y || 0) : 0;
-  const az = acc ? (acc.z || 0) : 0;
-  const deltaY = ay - motion.lastBeta;
-  const deltaZ = az - motion.lastGamma;
-  motion.lastBeta = ay;
-  motion.lastGamma = az;
-
-  const betaRate = (rot.beta || 0);
-  const gammaRate = (rot.gamma || 0);
-  const alphaRate = (rot.alpha || 0);
-
-  // Combine rotation + acceleration deltas. Use linear accel when available.
-  const linY = accLin ? (accLin.y || 0) : deltaY * 4;
-  const linZ = accLin ? (accLin.z || 0) : deltaZ * 4;
+  const betaRate = rot.beta || 0;
+  const gammaRate = rot.gamma || 0;
+  const alphaRate = rot.alpha || 0;
+  const linY = accLin ? (accLin.y || 0) : 0;
+  const linZ = accLin ? (accLin.z || 0) : 0;
 
   const signedVelocity =
     (betaRate / 120) +
@@ -675,22 +644,11 @@ function onDeviceMotion(e) {
     (linZ / 6) +
     (alphaRate / 240);
 
-  // Light smoothing — keeps response snappy while filtering jitter
   motion.ema = motion.ema * 0.12 + signedVelocity * 0.88;
 
   const now = performance.now();
   motion.history.push({ t: now, v: motion.ema });
-  // Keep last 8 samples regardless of time gap
   while (motion.history.length > 8) motion.history.shift();
-
-  // Palm mute via orientation: detect screen-down tilt (acc.z strongly negative when phone face-down)
-  // approximate: when acceleration along z exceeds ~5 (face up gives ~ -9.8 on iOS; face down ~ +9.8)
-  const zVal = acc.z || 0;
-  const tiltMute = zVal > 5; // ~30°+ tilted forward (screen facing down)
-  if (tiltMute !== state.palmMute) {
-    state.palmMute = tiltMute;
-    document.getElementById('mute-indicator').classList.toggle('on', tiltMute);
-  }
 
   detectStrum();
 }
@@ -702,86 +660,64 @@ function detectStrum() {
   const prev2 = motion.history[motion.history.length - 3];
   const now = performance.now();
 
-  // Direction-aware cooldown: reversals fire immediately; same-direction needs cooldown.
-  const lastDir = motion.lastFireDir || 0;
-  const curDir = Math.sign(last.v);
-  const reversing = curDir !== 0 && lastDir !== 0 && curDir !== lastDir;
-  const cooldownMs = reversing ? 0 : 130;
-  if (now - motion.lastFireT < cooldownMs) return;
+  const v = last.v;
+  const absV = Math.abs(v);
+  const dir = Math.sign(v);
+  if (!dir) return;
 
-  // Debounce: only blocks SAME-direction re-fires. Reversal always allowed.
-  if (motion.armed === false && !reversing) {
-    if (Math.abs(last.v) < state.sensitivity * 0.4) {
+  const threshold = dir > 0 ? state.sensitivity : state.upSensitivity;
+  const lastDir = motion.lastFireDir || 0;
+  const reversing = !!lastDir && dir !== lastDir;
+
+  // Cooldown: 45ms same-dir, 0ms reversal.
+  const cooldown = reversing ? DETECT.reversalCooldownMs : DETECT.minCooldownMs;
+  if (now - motion.lastFireT < cooldown) return;
+
+  // Re-arm: reversal always rearms; same-direction needs signal to fall.
+  if (!motion.armed) {
+    if (reversing || absV < threshold * DETECT.rearmRatio) {
       motion.armed = true;
     } else {
       return;
     }
   }
-  if (reversing) motion.armed = true;
 
-  // Track gesture start: first sample of this direction that exceeded 30% threshold
-  const riseThresh = state.sensitivity * 0.3;
-  const dirSignNow = Math.sign(last.v);
-  if (dirSignNow !== 0 && Math.abs(last.v) > riseThresh) {
-    if (motion.gestureStartT === 0 || Math.sign(motion.gestureStartV) !== dirSignNow) {
+  // Track gesture start (for sweep/sustain mapping)
+  const riseThresh = threshold * 0.3;
+  if (absV > riseThresh) {
+    if (motion.gestureStartT === 0 || Math.sign(motion.gestureStartV) !== dir) {
       motion.gestureStartT = last.t;
-      motion.gestureStartV = last.v;
-      motion.gesturePeakMag = Math.abs(last.v);
+      motion.gestureStartV = v;
       motion.gestureEnergy = 0;
     }
-    motion.gesturePeakMag = Math.max(motion.gesturePeakMag, Math.abs(last.v));
-    motion.gestureEnergy += Math.abs(last.v);
+    motion.gestureEnergy += absV;
   }
 
-  // Per-direction threshold: downstrokes use sensitivity, upstrokes need to clear
-  // upSensitivity. Lets users reset their hand upward without triggering an upstrum.
-  const thresholdFor = (v) => v > 0 ? state.sensitivity : state.upSensitivity;
+  // ----- Three fire conditions, in priority order -----
 
-  // Strategy 0 — rising edge: signal just crossed threshold. Fires the strum
-  // at the FIRST sample over threshold. No "baseline-quiet" check — that
-  // history scan was the main source of perceived latency.
+  // 1) Rising edge — fires at the FIRST sample over threshold.
+  //    Critical for slow strums: sound starts when the gesture starts,
+  //    not 200–400ms later at the velocity peak.
   let peakV = null;
-  const thrLast = thresholdFor(last.v);
-  if (Math.abs(last.v) >= thrLast && Math.abs(prev.v) < thrLast) {
-    peakV = last.v;
+  if (absV >= threshold && Math.abs(prev.v) < threshold) {
+    peakV = v;
   }
 
-  // Strategy A — direction flip: sign changed between prev and last AND latest
-  // sample is over threshold. Catches rapid down-up-down-up reversals.
-  if (peakV === null &&
-      Math.sign(last.v) !== 0 && Math.sign(prev.v) !== 0 &&
-      Math.sign(last.v) !== Math.sign(prev.v) &&
-      Math.abs(last.v) >= thrLast) {
-    peakV = last.v;
-  }
-
-  // Strategy B — instant surge: latest sample is a sharp jump from previous.
-  // Catches single-sample short flicks.
+  // 2) True local peak at the previous sample.
   if (peakV === null) {
-    if (Math.abs(last.v) >= thrLast &&
-        Math.abs(last.v) > Math.abs(prev.v) * 1.5 + thrLast * 0.25) {
-      peakV = last.v;
-    }
+    const prevAbs = Math.abs(prev.v);
+    const isLocalPeak =
+      Math.sign(prev.v) === dir &&
+      prevAbs >= Math.abs(prev2.v) &&
+      prevAbs > absV &&
+      prevAbs >= threshold;
+    if (isLocalPeak) peakV = prev.v;
   }
 
-  // Strategy C — classic peak: prev sample is a local extremum.
+  // 3) Hard surge — short flicks where we never see a clean peak.
   if (peakV === null) {
-    const dirNow = Math.sign(last.v - prev.v);
-    const dirPrev = Math.sign(prev.v - prev2.v);
-    if (dirNow !== dirPrev && dirPrev !== 0 && Math.abs(prev.v) >= thresholdFor(prev.v)) {
-      peakV = prev.v;
-    }
-  }
-
-  // Strategy D — wide surge: latest sample is big and baseline was quiet.
-  if (peakV === null) {
-    const thr = thresholdFor(last.v);
-    const big = thr * 1.4;
-    if (Math.abs(last.v) >= big) {
-      const oldest = motion.history[Math.max(0, motion.history.length - 5)] || prev2;
-      if (Math.abs(oldest.v) < thr * 0.5) {
-        peakV = last.v;
-      }
+    if (absV >= threshold * 1.55 && absV > Math.abs(prev.v) * 1.25) {
+      peakV = v;
     }
   }
 
@@ -790,65 +726,50 @@ function detectStrum() {
   motion.lastFireT = now;
   motion.lastFireDir = Math.sign(peakV);
   motion.armed = false;
-  const direction = peakV > 0 ? 1 : -1;
-  const mag = Math.abs(peakV);
-  const intensity = Math.min(1, Math.max(0.25, mag / Math.max(state.calibratedPeak, 1.0)));
 
-  // Measure gesture characteristics
+  const mag = Math.abs(peakV);
+  const intensity = Math.min(1, Math.max(0.2, mag / Math.max(state.calibratedPeak, 1.0)));
+
   const riseDuration = motion.gestureStartT > 0
-    ? Math.max(15, Math.min(450, now - motion.gestureStartT))
-    : 60;
+    ? Math.max(15, Math.min(400, now - motion.gestureStartT))
+    : 50;
   const gestureEnergy = motion.gestureEnergy;
 
-  // Reset gesture tracking — next motion starts fresh
   motion.gestureStartT = 0;
   motion.gestureStartV = 0;
   motion.gestureEnergy = 0;
 
-  strum(direction, intensity, riseDuration, gestureEnergy);
+  strum(peakV > 0 ? 1 : -1, intensity, riseDuration, gestureEnergy);
 
   const dot = document.getElementById('motion-dot');
-  if (dot) {
+  if (dot && dot.classList.contains('visible')) {
     dot.classList.add('hit');
     setTimeout(() => dot.classList.remove('hit'), 90);
   }
 }
 
+/* Orientation-based palm mute: requires sustained forward tilt (~120ms) so
+   transient acceleration during normal strums never triggers it. */
 function onDeviceOrientation(e) {
-  // Backup: derive a velocity-ish signal from orientation changes
   if (!state.motionEnabled) return;
-  const b = e.beta || 0;
-  const g = e.gamma || 0;
-  if (!motion._ori) motion._ori = { b, g, t: performance.now() };
+  const beta = e.beta || 0;
+  motion.orientBeta = beta;
+
+  const forwardTilt = beta > 35;
   const now = performance.now();
-  const dt = Math.max(8, now - motion._ori.t);
-  const db = (b - motion._ori.b) / dt * 50;
-  const dg = (g - motion._ori.g) / dt * 50;
-  motion._ori = { b, g, t: now };
-
-  // Only inject if devicemotion hasn't been producing data
-  if (!motion.history.length || now - motion.history[motion.history.length - 1].t > 80) {
-    const sig = db + dg * 0.4;
-    motion.ema = motion.ema * 0.3 + sig * 0.7;
-    motion.history.push({ t: now, v: motion.ema });
-    while (motion.history.length > 8) motion.history.shift();
-    const dot = document.getElementById('motion-dot');
-    if (dot && !dot.classList.contains('live')) dot.classList.add('live');
-    detectStrum();
+  if (forwardTilt) {
+    if (!motion.tiltCandidateSince) motion.tiltCandidateSince = now;
+    if (now - motion.tiltCandidateSince > 120 && !state.palmMute) {
+      state.palmMute = true;
+      document.getElementById('mute-indicator').classList.add('on');
+    }
+  } else {
+    motion.tiltCandidateSince = 0;
+    if (state.palmMute) {
+      state.palmMute = false;
+      document.getElementById('mute-indicator').classList.remove('on');
+    }
   }
-}
-
-/* ===== DEBUG READOUT ===== */
-let _peakSeen = 0;
-function startDebugReadout() {
-  const el = document.getElementById('debug-readout');
-  setInterval(() => {
-    const v = Math.abs(motion.ema);
-    if (v > _peakSeen) _peakSeen = v;
-    // decay slowly
-    _peakSeen *= 0.985;
-    el.textContent = `peak: ${_peakSeen.toFixed(2)} | now: ${v.toFixed(2)} | thr: ${state.sensitivity.toFixed(2)}`;
-  }, 80);
 }
 
 /* ===== TOUCH FALLBACK ===== */
@@ -1055,57 +976,18 @@ function advancePatternIfActive(direction) {
   setCurrentChordSilently(PATTERN[state.patternIndex]);
 }
 
-/* ===== CALIBRATION ===== */
-async function runCalibration() {
-  if (!state.motionEnabled) return; // skip calibration if no sensors
-  const overlay = document.getElementById('calib');
-  const step = document.getElementById('calib-step');
-  const hint = document.getElementById('calib-hint');
-  overlay.classList.remove('hidden');
-
-  // Phase 1: noise floor (2s still)
-  step.textContent = 'Hold still...';
-  hint.textContent = 'Keep the phone still for 2 seconds.';
-  const stillSamples = [];
-  const stillEnd = performance.now() + 2000;
-  const stillHandler = () => stillSamples.push(Math.abs(motion.ema));
-  const stillTimer = setInterval(stillHandler, 30);
-  await new Promise((res) => setTimeout(res, 2000));
-  clearInterval(stillTimer);
-  stillSamples.sort((a,b)=>a-b);
-  const noiseFloor = stillSamples[Math.floor(stillSamples.length * 0.9)] || 0.05;
-  state.noiseFloor = noiseFloor;
-
-  // Phase 2: typical strums (3s)
-  step.textContent = 'Now strum!';
-  hint.textContent = 'Make a few natural strums for 3 seconds.';
-  const peaks = [];
-  const peakTimer = setInterval(() => peaks.push(Math.abs(motion.ema)), 25);
-  await new Promise((res) => setTimeout(res, 3000));
-  clearInterval(peakTimer);
-  peaks.sort((a,b)=>b-a);
-  const topN = Math.min(10, peaks.length);
-  const peakAvg = topN > 0 ? peaks.slice(0, topN).reduce((a,b)=>a+b, 0) / topN : 0;
-
-  // If we saw real motion, calibrate; otherwise keep generous defaults so it works
-  if (peakAvg > 0.5) {
-    state.calibratedPeak = Math.max(1.5, peakAvg);
-    state.sensitivity = Math.max(0.3, Math.min(2.0, peakAvg * 0.3));
-  } else {
-    // No clear strum motion detected — leave permissive defaults
-    state.calibratedPeak = 3.0;
-    state.sensitivity = 0.6;
-  }
-  document.getElementById('sens-slider').value = state.sensitivity;
-
-  overlay.classList.add('hidden');
-}
-
-/* ===== HIDDEN SENSITIVITY PANEL ===== */
+/* ===== HIDDEN SENSITIVITY PANEL =====
+   Triple-tap the chord name reveals:
+     - sensitivity slider (updates upSensitivity too)
+     - the diagnostic debug readout + motion dot
+*/
 function setupSensitivityPanel() {
   const name = document.getElementById('chord-name');
   const panel = document.getElementById('sens-panel');
   const slider = document.getElementById('sens-slider');
+  const readout = document.getElementById('debug-readout');
+  const dot = document.getElementById('motion-dot');
+
   let taps = 0, lastTap = 0;
   name.addEventListener('click', () => {
     const now = performance.now();
@@ -1114,47 +996,66 @@ function setupSensitivityPanel() {
     taps++;
     if (taps >= 3) {
       panel.classList.toggle('hidden');
+      const showDiag = !panel.classList.contains('hidden');
+      readout.classList.toggle('visible', showDiag);
+      dot.classList.toggle('visible', showDiag);
       taps = 0;
     }
   });
+
   slider.addEventListener('input', () => {
     state.sensitivity = parseFloat(slider.value);
+    state.upSensitivity = state.sensitivity * DETECT.upRatio;
   });
 }
 
+let _peakSeen = 0;
+function startDebugReadout() {
+  const el = document.getElementById('debug-readout');
+  setInterval(() => {
+    const v = Math.abs(motion.ema);
+    if (v > _peakSeen) _peakSeen = v;
+    _peakSeen *= 0.985;
+    el.textContent = `peak: ${_peakSeen.toFixed(2)} | now: ${v.toFixed(2)} | thr: ${state.sensitivity.toFixed(2)}`;
+  }, 80);
+}
+
 /* ===== INIT ===== */
-async function start() {
+async function start(e) {
+  // Guard against double-fire. The start button is INSIDE the overlay, so a
+  // click on the button bubbles up — without this guard, start() ran twice
+  // and created two AudioContexts + two motion listener sets, which is the
+  // most plausible explanation for the "audio not attached to every stroke"
+  // feel observed in the demo video.
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  if (hasStarted) return;
+  hasStarted = true;
+
   // CRITICAL: on iOS Safari, both DeviceMotionEvent.requestPermission() AND
   // AudioContext creation must happen synchronously inside the user-gesture
   // handler. Don't await anything before these calls.
-
-  // 1. Create AudioContext synchronously (iOS requires this in the gesture).
   const AC = window.AudioContext || window.webkitAudioContext;
   state.ctx = new AC({ latencyHint: 'interactive' });
 
-  // 2. Fire the motion permission request synchronously (returns a promise).
   let motionPromise = null;
   if (typeof DeviceMotionEvent !== 'undefined' &&
       typeof DeviceMotionEvent.requestPermission === 'function') {
     motionPromise = DeviceMotionEvent.requestPermission();
   }
-  // Same for orientation on iOS 13+
   let orientPromise = null;
   if (typeof DeviceOrientationEvent !== 'undefined' &&
       typeof DeviceOrientationEvent.requestPermission === 'function') {
     orientPromise = DeviceOrientationEvent.requestPermission();
   }
 
-  // Hide overlay now that the gesture-critical work is queued.
   document.getElementById('start-overlay').classList.add('hidden');
 
-  // 3. Resume context (also needs gesture credit on iOS).
   if (state.ctx.state === 'suspended') {
-    try { await state.ctx.resume(); } catch (e) {}
+    try { await state.ctx.resume(); } catch (err) {}
   }
 
-  // 4. Build the rest of the audio graph.
   await finishAudioGraph();
+  buildPickNoiseBuffers(state.ctx);
 
   buildChordBar();
   resizeCanvas();
@@ -1162,43 +1063,37 @@ async function start() {
   requestAnimationFrame(drawGuitar);
   setupTouchFallback();
   setupSensitivityPanel();
+  startDebugReadout();
 
-  // 5. Resolve motion/orientation permission and wire up listeners.
   let motionGranted = true;
   try {
     if (motionPromise) {
       const r = await motionPromise;
       motionGranted = (r === 'granted');
     }
-    if (orientPromise) {
-      await orientPromise; // ignore result; orientation is non-critical
-    }
-  } catch (e) { motionGranted = false; }
+    if (orientPromise) await orientPromise;
+  } catch (err) { motionGranted = false; }
 
   if (motionGranted) {
     window.addEventListener('devicemotion', onDeviceMotion, { passive: true });
     window.addEventListener('deviceorientation', onDeviceOrientation, { passive: true });
     state.motionEnabled = true;
   } else {
-    // Permission denied — still works via touch fallback
     const readout = document.getElementById('debug-readout');
     if (readout) readout.textContent = 'Motion denied — use touch';
   }
 
-  state.sensitivity = 1.4;
-  state.upSensitivity = 4.5;
-  state.calibratedPeak = 4.0;
-  document.getElementById('sens-slider').value = state.sensitivity;
-  startDebugReadout();
-  // Register SW
   if ('serviceWorker' in navigator) {
-    try { navigator.serviceWorker.register('/sw.js'); } catch (e) {}
+    try { navigator.serviceWorker.register('/sw.js'); } catch (err) {}
   }
 }
 
-document.getElementById('start-btn').addEventListener('click', start);
-// Allow tapping anywhere on overlay
-document.getElementById('start-overlay').addEventListener('click', start);
+// pointerdown + { once: true } + stopPropagation = exactly one start() call,
+// even when the user taps the button inside the overlay.
+const startBtn = document.getElementById('start-btn');
+const startOverlay = document.getElementById('start-overlay');
+startBtn.addEventListener('pointerdown', start, { once: true });
+startOverlay.addEventListener('pointerdown', start, { once: true });
 
 // Prevent iOS scrolling/zoom
 document.addEventListener('gesturestart', (e) => e.preventDefault());
